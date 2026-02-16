@@ -1,0 +1,6 @@
+config.json
+assistant.db
+assistant.log
+__pycache__
+credentials.json
+token.json

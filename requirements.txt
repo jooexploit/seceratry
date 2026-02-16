@@ -1,0 +1,27 @@
+# Core
+requests>=2.31.0
+
+# Google Calendar
+google-api-python-client>=2.150.0
+google-auth-httplib2>=0.2.0
+google-auth-oauthlib>=1.2.1
+
+# Dashboard
+Flask>=3.0.0
+
+# Tray
+pystray>=0.19.5
+Pillow>=10.0.0
+
+# Telegram control bot
+python-telegram-bot>=21.0
+
+# Screenshot backend (recommended for Telegram /screenshot)
+mss>=10.0.0
+
+# Extra screenshot fallback via Pillow ImageGrab
+# (Pillow is already required for tray support above)
+
+# Arabic rendering for Tkinter Quran gate
+arabic-reshaper>=3.0.0
+python-bidi>=0.4.2
