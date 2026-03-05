@@ -7,12 +7,14 @@ import html
 import json
 import logging
 import os
+import platform
 import re
 import shlex
 import shutil
 import signal
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -87,9 +89,9 @@ except ImportError:
 
 # Optional: Telegram bot
 try:
-    from telegram import Update
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
     from telegram.ext import Application as TelegramApplication
-    from telegram.ext import CommandHandler, ContextTypes
+    from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes
 
     HAS_TELEGRAM = True
 except ImportError:
@@ -104,10 +106,19 @@ try:
 except ImportError:
     HAS_MSS = False
 
-BASE_DIR = Path(__file__).resolve().parent
+from assistant_app.config import apply_env_map, collect_secret_values, load_dotenv_file, redact_sensitive_text
+from assistant_app.install.linux_autostart import install_linux_autostart, uninstall_linux_autostart
+from assistant_app.install.windows_autostart import install_windows_task, uninstall_windows_task
+from assistant_app.migrations import apply_v2_migrations
+from assistant_app.platform import get_platform_adapter
+from assistant_app.runtime_state import SensitiveActionStore
+from assistant_app.services.scoring import calculate_daily_score, format_score_text
+
+BASE_DIR = Path(__file__).resolve().parent.parent
 CONFIG_PATH = BASE_DIR / "config.json"
 GOOGLE_TOKEN_PATH = BASE_DIR / "token.json"
 LEGACY_QURAN_STATE_PATH = BASE_DIR / "quran_state.json"
+DOTENV_PATH = BASE_DIR / ".env"
 
 SCOPES = ["https://www.googleapis.com/auth/calendar.readonly"]
 
@@ -183,6 +194,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "credentials_path": str(BASE_DIR / "credentials.json"),
         "notify_before_minutes": 10,
         "meeting_prep_minutes": 30,
+        "auto_focus_before_minutes": 20,
+        "auto_focus_after_minutes": 10,
         "poll_seconds": 60,
         "max_events": 40,
     },
@@ -192,6 +205,40 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "work_blocklist_websites": ["youtube.com", "twitter.com", "tiktok.com"],
         "silent_notifications": True,
         "hosts_backup_path": "/etc/hosts.productivity_backup",
+    },
+    "features": {
+        "telegram_inline_panel": True,
+        "calendar_auto_focus": False,
+        "daily_score": True,
+        "quran_goals": True,
+        "prayer_recovery_flow": True,
+        "weekly_report_push": True,
+        "telegram_sensitive_confirm": True,
+        "personal_modes": True,
+    },
+    "security": {
+        "require_env_secrets": True,
+        "redact_secrets_in_logs": True,
+    },
+    "personal_modes": {
+        "default_mode": "workday",
+        "profiles": {
+            "workday": {
+                "pomodoro.work_minutes": 50,
+                "health.water_interval_minutes": 60,
+                "health.stretch_interval_minutes": 90,
+            },
+            "light": {
+                "pomodoro.work_minutes": 35,
+                "health.water_interval_minutes": 75,
+                "health.stretch_interval_minutes": 110,
+            },
+            "ramadan": {
+                "pomodoro.work_minutes": 40,
+                "health.water_interval_minutes": 70,
+                "health.stretch_interval_minutes": 100,
+            },
+        },
     },
     "daily_report": {
         "enabled": True,
@@ -205,6 +252,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "start_juz": 1,
         "start_page": 1,
         "start_unit": 1,
+        "daily_target_units": 1,
         "restart_on_complete": False,
         "resume_progress": True,
         "force_arabic_reshaper": True,
@@ -419,6 +467,10 @@ QURAN_TOKEN_CACHE: Dict[str, Any] = {
 }
 
 FOCUS_MANAGER: Optional["FocusModeManager"] = None
+PLATFORM_ADAPTER = get_platform_adapter()
+SENSITIVE_ACTIONS = SensitiveActionStore()
+ACTIVE_MODE = "workday"
+SECRET_VALUES: List[str] = []
 
 
 def deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
@@ -471,12 +523,15 @@ def responsive_sleep(seconds: float, granularity: float = 1.0) -> bool:
 
 
 def register_error(source: str, message: str):
+    msg = str(message)
+    if APP_CONFIG.get("security", {}).get("redact_secrets_in_logs", True):
+        msg = redact_sensitive_text(msg, SECRET_VALUES)
     with RUNTIME_LOCK:
         RUNTIME_STATE["last_errors"].append(
             {
                 "ts": utc_now_iso(),
                 "source": source,
-                "message": message,
+                "message": msg,
             }
         )
 
@@ -524,6 +579,7 @@ def toggle_feature(feature: str) -> bool:
 
 
 def init_feature_toggles(config: Dict[str, Any]):
+    fcfg = config.get("features", {})
     initial = {
         "prayers": bool(config.get("prayers", {}).get("enabled", False)),
         "pomodoro": bool(config.get("pomodoro", {}).get("enabled", False)),
@@ -533,6 +589,14 @@ def init_feature_toggles(config: Dict[str, Any]):
         "focus_mode": bool(config.get("focus_mode", {}).get("enabled", False)),
         "dashboard": bool(config.get("dashboard", {}).get("enabled", False)),
         "telegram": bool(config.get("telegram_bot", {}).get("enabled", False)),
+        "daily_score": bool(fcfg.get("daily_score", True)),
+        "calendar_auto_focus": bool(fcfg.get("calendar_auto_focus", False)),
+        "quran_goals": bool(fcfg.get("quran_goals", True)),
+        "prayer_recovery_flow": bool(fcfg.get("prayer_recovery_flow", True)),
+        "weekly_report_push": bool(fcfg.get("weekly_report_push", True)),
+        "telegram_inline_panel": bool(fcfg.get("telegram_inline_panel", True)),
+        "telegram_sensitive_confirm": bool(fcfg.get("telegram_sensitive_confirm", True)),
+        "personal_modes": bool(fcfg.get("personal_modes", True)),
     }
     with CONTROL_LOCK:
         CONTROL_STATE["feature_toggles"].update(initial)
@@ -591,32 +655,7 @@ def notify(
         DB.log_event(category, title, body)
 
     try:
-        if shutil.which("notify-send"):
-            level = "critical" if urgency == "critical" else "normal"
-            subprocess.run(
-                ["notify-send", "-u", level, title, body],
-                check=False,
-                env=safe_subprocess_env(),
-            )
-        elif shutil.which("zenity"):
-            flag = "--warning" if urgency == "critical" else "--info"
-            subprocess.Popen(
-                [
-                    "zenity",
-                    flag,
-                    "--width=420",
-                    "--height=180",
-                    "--title",
-                    title,
-                    "--text",
-                    body,
-                ],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                env=safe_subprocess_env(),
-            )
-        else:
-            print(f"[NOTIFY] {title}: {body}")
+        PLATFORM_ADAPTER.notify(title=title, body=body, urgency=urgency)
     except Exception as exc:
         register_error("notify", str(exc))
         LOGGER.exception("notify_failed")
@@ -628,13 +667,7 @@ def big_alert(message: str):
 
 def ask_yes_no(question: str) -> bool:
     try:
-        if shutil.which("zenity"):
-            result = subprocess.run(
-                ["zenity", "--question", "--text", question],
-                check=False,
-                env=safe_subprocess_env(),
-            )
-            return result.returncode == 0
+        return PLATFORM_ADAPTER.ask_yes_no(question)
     except Exception as exc:
         register_error("ask_yes_no", str(exc))
         LOGGER.exception("ask_yes_no_failed")
@@ -684,14 +717,18 @@ def to_arabic_digits(value: Any) -> str:
 
 class JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
+        msg = record.getMessage()
+        if APP_CONFIG.get("security", {}).get("redact_secrets_in_logs", True):
+            msg = redact_sensitive_text(msg, SECRET_VALUES)
         payload = {
             "ts": datetime.now(timezone.utc).isoformat(),
             "level": record.levelname,
             "logger": record.name,
-            "msg": record.getMessage(),
+            "msg": msg,
         }
         if record.exc_info:
-            payload["exc"] = self.formatException(record.exc_info)
+            exc_text = self.formatException(record.exc_info)
+            payload["exc"] = redact_sensitive_text(exc_text, SECRET_VALUES)
         return json.dumps(payload, ensure_ascii=False)
 
 
@@ -742,6 +779,10 @@ def apply_env_overrides(cfg: Dict[str, Any]):
 
     tcfg = cfg.setdefault("telegram_bot", {})
     tcfg["token"] = os.getenv("TELEGRAM_BOT_TOKEN", tcfg.get("token", ""))
+
+    mode_env = os.getenv("ASSISTANT_DEFAULT_MODE")
+    if mode_env:
+        cfg.setdefault("personal_modes", {})["default_mode"] = mode_env.strip().lower()
 
 
 def validate_config(cfg: Dict[str, Any]) -> Tuple[List[str], List[str]]:
@@ -820,6 +861,17 @@ def validate_config(cfg: Dict[str, Any]) -> Tuple[List[str], List[str]]:
             "until at least one chat id is configured."
         )
 
+    scfg = cfg.get("security", {})
+    require_env_secrets = bool(scfg.get("require_env_secrets", True))
+    if require_env_secrets and tcfg.get("enabled", False) and not os.getenv("TELEGRAM_BOT_TOKEN"):
+        errors.append("security.require_env_secrets=true but TELEGRAM_BOT_TOKEN is not set.")
+
+    if require_env_secrets and qcfg.get("enabled", False):
+        if not os.getenv("QURAN_CLIENT_ID"):
+            errors.append("security.require_env_secrets=true but QURAN_CLIENT_ID is not set.")
+        if not os.getenv("QURAN_CLIENT_SECRET"):
+            errors.append("security.require_env_secrets=true but QURAN_CLIENT_SECRET is not set.")
+
     return errors, warnings
 
 
@@ -827,11 +879,16 @@ def load_config() -> Dict[str, Any]:
     if not CONFIG_PATH.exists():
         raise FileNotFoundError(f"config.json not found at {CONFIG_PATH}")
 
+    env_map = load_dotenv_file(DOTENV_PATH)
+    apply_env_map(env_map)
+
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
         raw_cfg = json.load(f)
 
     merged = deep_merge(DEFAULT_CONFIG, raw_cfg)
     apply_env_overrides(merged)
+    global SECRET_VALUES
+    SECRET_VALUES = collect_secret_values(merged)
     return merged
 
 
@@ -911,6 +968,7 @@ class AssistantDB:
                 );
                 """
             )
+            apply_v2_migrations(self.conn)
             self.conn.commit()
 
     def ensure_day(self, day: Optional[str] = None):
@@ -1105,6 +1163,36 @@ class AssistantDB:
             (key, value),
         )
 
+    def get_setting(self, key: str, default: Optional[str] = None) -> Optional[str]:
+        row = self._query_one("SELECT value FROM app_settings WHERE key=?", (key,))
+        if not row:
+            return default
+        return row["value"]
+
+    def set_setting(self, key: str, value: str):
+        self._exec(
+            """
+            INSERT INTO app_settings(key, value, updated_at)
+            VALUES(?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
+            """,
+            (key, value, utc_now_iso()),
+        )
+
+    def is_weekly_report_sent(self, week_key: str) -> bool:
+        row = self._query_one("SELECT week_key FROM weekly_report_log WHERE week_key=?", (week_key,))
+        return bool(row)
+
+    def mark_weekly_report_sent(self, week_key: str, payload: str):
+        self._exec(
+            """
+            INSERT INTO weekly_report_log(week_key, sent_at, payload)
+            VALUES(?, ?, ?)
+            ON CONFLICT(week_key) DO UPDATE SET sent_at=excluded.sent_at, payload=excluded.payload
+            """,
+            (week_key, utc_now_iso(), payload),
+        )
+
     def close(self):
         with self.lock:
             self.conn.close()
@@ -1122,11 +1210,93 @@ def build_compliance_chart_lines(week_rows: List[Dict[str, Any]]) -> List[str]:
     return lines
 
 
+def current_mode() -> str:
+    if DB:
+        stored = DB.get_setting("active_mode")
+        if stored:
+            return stored
+    return APP_CONFIG.get("personal_modes", {}).get("default_mode", "workday")
+
+
+def set_mode(mode: str) -> bool:
+    m = (mode or "").strip().lower()
+    profiles = APP_CONFIG.get("personal_modes", {}).get("profiles", {})
+    if m not in profiles:
+        return False
+
+    profile = profiles.get(m, {})
+    if "pomodoro.work_minutes" in profile:
+        APP_CONFIG.setdefault("pomodoro", {})["work_minutes"] = int(profile["pomodoro.work_minutes"])
+    if "health.water_interval_minutes" in profile:
+        APP_CONFIG.setdefault("health", {})["water_interval_minutes"] = int(profile["health.water_interval_minutes"])
+    if "health.stretch_interval_minutes" in profile:
+        APP_CONFIG.setdefault("health", {})["stretch_interval_minutes"] = int(profile["health.stretch_interval_minutes"])
+    if DB:
+        DB.set_setting("active_mode", m)
+    global ACTIVE_MODE
+    ACTIVE_MODE = m
+    return True
+
+
+def get_quran_daily_goal() -> int:
+    default_goal = int(APP_CONFIG.get("quran_khatma", {}).get("daily_target_units", 1))
+    if not DB:
+        return max(1, default_goal)
+    val = DB.get_setting("quran_daily_goal")
+    if val is None:
+        return max(1, default_goal)
+    try:
+        return max(1, int(val))
+    except Exception:
+        return max(1, default_goal)
+
+
+def set_quran_daily_goal(units: int) -> int:
+    value = max(1, min(60, int(units)))
+    if DB:
+        DB.set_setting("quran_daily_goal", str(value))
+    APP_CONFIG.setdefault("quran_khatma", {})["daily_target_units"] = value
+    return value
+
+
+def get_quran_daily_progress(mode: str) -> Dict[str, int]:
+    goal = get_quran_daily_goal()
+    if not DB:
+        return {"goal": goal, "done": 0}
+    today = day_key()
+    marker = DB.get_setting(f"quran_progress_marker:{today}:{mode}")
+    if marker is None:
+        return {"goal": goal, "done": 0}
+    try:
+        done = max(0, int(marker))
+    except Exception:
+        done = 0
+    return {"goal": goal, "done": done}
+
+
+def set_quran_daily_progress(mode: str, done: int):
+    if DB:
+        DB.set_setting(f"quran_progress_marker:{day_key()}:{mode}", str(max(0, done)))
+
+
+def compute_daily_score_payload(metrics: Dict[str, Any], streak: int) -> Dict[str, Any]:
+    score = calculate_daily_score(metrics, streak)
+    return {
+        "total": score.total,
+        "focus": score.focus,
+        "prayers": score.prayers,
+        "health": score.health,
+        "consistency": score.consistency,
+        "text": format_score_text(score),
+    }
+
+
 def runtime_snapshot() -> Dict[str, Any]:
     today_metrics = DB.get_day_metrics(day_key()) if DB else {}
     week = DB.get_week_compliance(7) if DB else []
     chart = build_compliance_chart_lines(week)
     streak = DB.get_prayer_streak() if DB else 0
+    daily_score = compute_daily_score_payload(today_metrics, streak)
     bookmarks = DB.list_bookmarks(limit=8) if DB else []
     recent_events = DB.get_recent_events(limit=25) if DB else []
     qcfg = APP_CONFIG.get("quran_khatma", {}) if isinstance(APP_CONFIG, dict) else {}
@@ -1144,6 +1314,8 @@ def runtime_snapshot() -> Dict[str, Any]:
             except Exception:
                 pass
     quran_current_unit = max(1, min(int(QURAN_MODE_META[quran_mode]["count"]), quran_current_unit))
+    quran_goal = get_quran_daily_goal()
+    quran_progress = get_quran_daily_progress(quran_mode)
 
     with CONTROL_LOCK:
         pause_until = CONTROL_STATE.get("pause_until")
@@ -1170,6 +1342,7 @@ def runtime_snapshot() -> Dict[str, Any]:
         "threads": threads,
         "today_metrics": today_metrics,
         "prayer_streak": streak,
+        "daily_score": daily_score,
         "weekly_compliance": week,
         "weekly_compliance_chart": chart,
         "next_prayer": next_prayer,
@@ -1179,23 +1352,50 @@ def runtime_snapshot() -> Dict[str, Any]:
         "recent_events": recent_events,
         "quran_mode": quran_mode,
         "quran_current_unit": quran_current_unit,
+        "quran_daily_goal": quran_goal,
+        "quran_daily_progress": quran_progress,
+        "active_mode": current_mode(),
+        "capabilities": PLATFORM_ADAPTER.capabilities(),
         "quran_resume_progress": bool(qcfg.get("resume_progress", True)),
     }
 
 
 def format_snapshot_text(snap: Dict[str, Any]) -> str:
     metrics = snap.get("today_metrics", {})
+    score = snap.get("daily_score", {})
     lines = [
         f"Now: {snap.get('now')}",
         f"Next prayer: {snap.get('next_prayer')}",
         f"Prayer streak: {snap.get('prayer_streak')} days",
+        f"Daily score: {score.get('total', 0)}/100",
         f"Pomodoro sessions: {metrics.get('pomodoro_sessions', 0)}",
         f"Focus minutes: {metrics.get('total_focus_minutes', 0)}",
         f"Water reminders: {metrics.get('water_reminders', 0)}",
         f"Stretch reminders: {metrics.get('stretch_reminders', 0)}",
         f"Eye breaks: {metrics.get('eye_breaks', 0)}",
         f"Prayers: {metrics.get('prayers_prayed', 0)}/{metrics.get('prayers_planned', 0)}",
+        f"Quran daily goal: {snap.get('quran_daily_progress', {}).get('done', 0)}/{snap.get('quran_daily_goal', 1)}",
+        f"Mode: {snap.get('active_mode', 'workday')}",
     ]
+    return "\n".join(lines)
+
+
+def build_weekly_summary_text() -> str:
+    if not DB:
+        return "No database available."
+    rows = DB.get_week_compliance(7)
+    chart = build_compliance_chart_lines(rows)
+    today_metrics = DB.get_day_metrics(day_key())
+    streak = DB.get_prayer_streak()
+    score = compute_daily_score_payload(today_metrics, streak)
+    lines = [
+        f"Weekly summary ({day_key()}):",
+        f"- Streak: {streak} days",
+        f"- Daily score now: {score.get('total', 0)}/100",
+        "",
+        "Compliance:",
+    ]
+    lines.extend(chart)
     return "\n".join(lines)
 
 
@@ -1415,62 +1615,11 @@ def run_allowlisted_shell_command(raw_command: str, tcfg: Dict[str, Any]) -> Tup
 
 
 def list_open_windows(limit: int = 25) -> List[str]:
-    rows: List[str] = []
-
-    # Best backend: wmctrl
-    if shutil.which("wmctrl"):
-        rc, out, _ = run_command_capture(["wmctrl", "-lx"], timeout=10)
-        if rc == 0 and out:
-            for line in out.splitlines():
-                parts = line.split(None, 4)
-                if len(parts) < 5:
-                    continue
-                wm_class = parts[3]
-                title = parts[4].strip()
-                if not title:
-                    continue
-                rows.append(f"{wm_class} | {title}")
-
-    # Fallback: xdotool (works on many X11 setups without wmctrl)
-    if not rows and shutil.which("xdotool"):
-        rc, out, _ = run_command_capture(["xdotool", "search", "--onlyvisible", "--name", "."], timeout=10)
-        if rc == 0 and out:
-            win_ids: List[str] = []
-            seen = set()
-            for line in out.splitlines():
-                win_id = line.strip()
-                if not win_id or win_id in seen:
-                    continue
-                seen.add(win_id)
-                win_ids.append(win_id)
-
-            max_scan = max(limit * 4, 80)
-            for win_id in win_ids[:max_scan]:
-                rc1, title, _ = run_command_capture(["xdotool", "getwindowname", win_id], timeout=6)
-                if rc1 != 0 or not title:
-                    continue
-                rc2, wclass, _ = run_command_capture(["xdotool", "getwindowclassname", win_id], timeout=6)
-                clazz = wclass.strip() if rc2 == 0 and wclass else "window"
-                rows.append(f"{clazz} | {title.strip()}")
-                if len(rows) >= limit:
-                    break
-
-    # Fallback: xwininfo title parsing
-    if not rows and shutil.which("xwininfo"):
-        rc, out, _ = run_command_capture(["xwininfo", "-root", "-tree"], timeout=10)
-        if rc == 0 and out:
-            for line in out.splitlines():
-                match = re.search(r'"([^"]+)"', line)
-                if not match:
-                    continue
-                title = match.group(1).strip()
-                if not title:
-                    continue
-                rows.append(f"window | {title}")
-                if len(rows) >= limit:
-                    break
-
-    return rows[: max(1, limit)]
+    try:
+        return PLATFORM_ADAPTER.list_open_windows(limit=max(1, limit))
+    except Exception as exc:
+        register_error("windows_list", str(exc))
+        return []
 
 
 def list_browser_tab_like_titles(limit: int = 20) -> List[str]:
@@ -1481,14 +1630,11 @@ def list_browser_tab_like_titles(limit: int = 20) -> List[str]:
 
 
 def get_active_window_title() -> str:
-    if shutil.which("xdotool"):
-        rc, out, err = run_command_capture(["xdotool", "getactivewindow", "getwindowname"], timeout=8)
-        if rc == 0 and out:
-            return out
-        if err:
-            return f"Error: {err}"
-    rows = list_open_windows(limit=1)
-    return rows[0] if rows else "Active window not available."
+    try:
+        return PLATFORM_ADAPTER.get_active_window_title()
+    except Exception as exc:
+        register_error("active_window", str(exc))
+        return "Active window not available."
 
 
 def guess_x11_screen_size(default_size: str = "1920x1080") -> str:
@@ -1526,184 +1672,54 @@ def screenshot_is_mostly_black(path: Path) -> bool:
 
 
 def capture_screenshot(path: Path) -> Tuple[bool, str]:
-    session_type = (os.environ.get("XDG_SESSION_TYPE", "") or "").strip().lower()
-    is_wayland = session_type == "wayland" or bool(os.environ.get("WAYLAND_DISPLAY"))
-    errors: List[str] = []
-
-    def success_or_black(backend_name: str) -> bool:
-        if not path.exists() or path.stat().st_size <= 0:
-            return False
-        if screenshot_is_mostly_black(path):
-            msg = (
-                f"{backend_name} produced a mostly black image "
-                f"(session={session_type or 'unknown'})."
-            )
-            errors.append(msg)
-            register_error("screenshot", msg)
-            return False
-        return True
-
-    def run_command_backend(command: List[str], label: str) -> bool:
-        if not shutil.which(command[0]):
-            return False
-        rc, _, err = run_command_capture(command, timeout=20)
-        if rc == 0 and success_or_black(label):
-            return True
-        if err:
-            msg = f"{label} failed: {err}"
-            errors.append(msg)
-            register_error("screenshot", msg)
-        return False
-
-    # Wayland-first strategy: CLI tools usually integrate better with portals.
-    if is_wayland:
-        wayland_commands = [
-            (["grim", str(path)], "grim"),
-            (["grimshot", "save", "screen", str(path)], "grimshot"),
-            (["gnome-screenshot", "-f", str(path)], "gnome-screenshot"),
-            (["spectacle", "-b", "-n", "-o", str(path)], "spectacle"),
-            (["xfce4-screenshooter", "-f", "-s", str(path)], "xfce4-screenshooter"),
-        ]
-        for cmd, label in wayland_commands:
-            if run_command_backend(cmd, label):
-                return True, label
-
-    if HAS_MSS:
-        try:
-            with mss.mss() as sct:
-                shot = sct.grab(sct.monitors[0])
-                mss.tools.to_png(shot.rgb, shot.size, output=str(path))
-            if success_or_black("mss"):
-                return True, "mss"
-        except Exception as exc:
-            msg = f"mss failed: {exc}"
-            errors.append(msg)
-            register_error("screenshot", msg)
-
-    # x11grab only works reliably on X11 sessions.
-    if not is_wayland and shutil.which("ffmpeg"):
-        display = os.environ.get("DISPLAY", ":0")
-        video_size = guess_x11_screen_size()
-        ffmpeg_cmd = [
-            "ffmpeg",
-            "-y",
-            "-loglevel",
-            "error",
-            "-f",
-            "x11grab",
-            "-draw_mouse",
-            "1",
-            "-video_size",
-            video_size,
-            "-i",
-            display,
-            "-frames:v",
-            "1",
-            "-update",
-            "1",
-            str(path),
-        ]
-        rc, _, err = run_command_capture(ffmpeg_cmd, timeout=20)
-        if rc == 0 and success_or_black("ffmpeg x11grab"):
-            return True, "ffmpeg x11grab"
-        if err:
-            msg = f"ffmpeg failed: {err}"
-            errors.append(msg)
-            register_error("screenshot", msg)
-
-    if HAS_IMAGEGRAB:
-        try:
-            img = ImageGrab.grab(all_screens=True)
-            img.save(path, format="PNG")
-            if success_or_black("Pillow ImageGrab"):
-                return True, "Pillow ImageGrab"
-        except Exception as exc:
-            msg = f"ImageGrab failed: {exc}"
-            errors.append(msg)
-            register_error("screenshot", msg)
-
-    fallback_commands = [
-        (["gnome-screenshot", "-f", str(path)], "gnome-screenshot"),
-        (["scrot", str(path)], "scrot"),
-        (["grim", str(path)], "grim"),
-        (["grimshot", "save", "screen", str(path)], "grimshot"),
-        (["spectacle", "-b", "-n", "-o", str(path)], "spectacle"),
-        (["xfce4-screenshooter", "-f", "-s", str(path)], "xfce4-screenshooter"),
-        (["import", "-window", "root", str(path)], "import"),
-    ]
-    for cmd, label in fallback_commands:
-        if run_command_backend(cmd, label):
-            return True, label
-
-    if errors:
-        return False, "No screenshot backend available. " + truncate_text(" | ".join(errors), 600)
-    return False, f"No screenshot backend available (session={session_type or 'unknown'})."
+    try:
+        return PLATFORM_ADAPTER.capture_screenshot(path)
+    except Exception as exc:
+        register_error("screenshot", str(exc))
+        return False, str(exc)
 
 
 def execute_lock_screen() -> Tuple[bool, str]:
-    candidates = [
-        ["loginctl", "lock-session"],
-        ["gnome-screensaver-command", "-l"],
-        ["dm-tool", "lock"],
-    ]
-    for cmd in candidates:
-        if not shutil.which(cmd[0]):
-            continue
-        rc, _, err = run_command_capture(cmd, timeout=10)
-        if rc == 0:
-            return True, f"Lock command executed: {' '.join(cmd)}"
-        if err:
-            return False, err
-    return False, "No lock command available on this system."
+    try:
+        return PLATFORM_ADAPTER.lock_screen()
+    except Exception as exc:
+        register_error("lock_screen", str(exc))
+        return False, str(exc)
 
 
 def execute_suspend() -> Tuple[bool, str]:
-    if not shutil.which("systemctl"):
-        return False, "systemctl not found."
-    rc, _, err = run_command_capture(["systemctl", "suspend"], timeout=10)
-    if rc == 0:
-        return True, "Suspend command sent."
-    return False, err or f"systemctl returned {rc}"
+    try:
+        return PLATFORM_ADAPTER.suspend()
+    except Exception as exc:
+        register_error("suspend", str(exc))
+        return False, str(exc)
 
 
 def execute_power_action(action: str, value: Optional[str]) -> Tuple[bool, str]:
-    if not shutil.which("shutdown"):
-        return False, "shutdown command not found."
-
-    action = action.lower()
-    if action == "cancel":
-        rc, _, err = run_command_capture(["shutdown", "-c"], timeout=10)
-        if rc == 0:
-            return True, "Scheduled shutdown/reboot canceled."
-        return False, err or f"shutdown -c returned {rc}"
-
-    delay = (value or "now").strip().lower()
-    if delay in ("now", "0"):
-        delay_arg = "now"
-    else:
-        delay_min = parse_int_arg(delay, default=1, min_value=1, max_value=1440)
-        delay_arg = f"+{delay_min}"
-
-    if action == "shutdown":
-        cmd = ["shutdown", "-h", delay_arg]
-    elif action == "reboot":
-        cmd = ["shutdown", "-r", delay_arg]
-    else:
-        return False, "Unsupported power action."
-
-    rc, _, err = run_command_capture(cmd, timeout=10)
-    if rc == 0:
-        when = "now" if delay_arg == "now" else delay_arg
-        return True, f"{action} scheduled {when}."
-    return False, err or f"{' '.join(cmd)} returned {rc}"
+    try:
+        return PLATFORM_ADAPTER.power_action(action, value)
+    except Exception as exc:
+        register_error("power_action", str(exc))
+        return False, str(exc)
 
 
 def get_top_processes(limit: int = 10) -> str:
     limit = max(1, min(40, limit))
-    rc, out, err = run_command_capture(
-        ["ps", "-eo", "pid,comm,%cpu,%mem", "--sort=-%cpu"],
-        timeout=12,
-    )
+    if platform.system().lower() == "windows":
+        rc, out, err = run_command_capture(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                f"Get-Process | Sort-Object CPU -Descending | Select-Object -First {limit} Id,ProcessName,CPU,PM",
+            ],
+            timeout=12,
+        )
+    else:
+        rc, out, err = run_command_capture(
+            ["ps", "-eo", "pid,comm,%cpu,%mem", "--sort=-%cpu"],
+            timeout=12,
+        )
     if rc != 0:
         return err or "Failed to query processes."
     lines = out.splitlines()
@@ -1731,38 +1747,25 @@ class FocusModeManager:
             backup_path = fcfg.get("hosts_backup_path", "/etc/hosts.productivity_backup")
 
             if websites:
-                try:
-                    if not Path(backup_path).exists() and Path("/etc/hosts").exists():
-                        shutil.copy2("/etc/hosts", backup_path)
-
-                    hosts_text = Path("/etc/hosts").read_text(encoding="utf-8")
-                    if self.BLOCK_START not in hosts_text:
-                        block_lines = [self.BLOCK_START]
-                        for domain in websites:
-                            block_lines.append(f"127.0.0.1 {domain}")
-                        block_lines.append(self.BLOCK_END)
-                        hosts_text = hosts_text.rstrip() + "\n\n" + "\n".join(block_lines) + "\n"
-                        Path("/etc/hosts").write_text(hosts_text, encoding="utf-8")
-                except PermissionError:
-                    register_error("focus_mode", "No permission to edit /etc/hosts")
-                    LOGGER.warning("No permission to edit /etc/hosts")
-                except Exception as exc:
-                    register_error("focus_mode", str(exc))
-                    LOGGER.exception("focus_apply_hosts_failed")
+                ok, msg = PLATFORM_ADAPTER.apply_focus_web_block(websites, backup_path)
+                if not ok:
+                    register_error("focus_mode", msg)
+                    LOGGER.warning("focus_apply_hosts_failed: %s", msg)
 
             if fcfg.get("silent_notifications", True):
                 try:
-                    subprocess.run(
-                        [
-                            "gsettings",
-                            "set",
-                            "org.gnome.desktop.notifications",
-                            "show-banners",
-                            "false",
-                        ],
-                        check=False,
-                    )
-                    self.dnd_changed = True
+                    if platform.system().lower() == "linux":
+                        subprocess.run(
+                            [
+                                "gsettings",
+                                "set",
+                                "org.gnome.desktop.notifications",
+                                "show-banners",
+                                "false",
+                            ],
+                            check=False,
+                        )
+                        self.dnd_changed = True
                 except Exception as exc:
                     register_error("focus_mode", str(exc))
                     LOGGER.warning("Could not toggle GNOME notifications")
@@ -1778,40 +1781,24 @@ class FocusModeManager:
             fcfg = config.get("focus_mode", {})
             backup_path = fcfg.get("hosts_backup_path", "/etc/hosts.productivity_backup")
 
-            try:
-                hosts = Path("/etc/hosts")
-                if hosts.exists():
-                    text = hosts.read_text(encoding="utf-8")
-                    if self.BLOCK_START in text and self.BLOCK_END in text:
-                        pattern = re.compile(
-                            re.escape(self.BLOCK_START)
-                            + r".*?"
-                            + re.escape(self.BLOCK_END)
-                            + r"\n?",
-                            flags=re.S,
-                        )
-                        text = re.sub(pattern, "", text)
-                        hosts.write_text(text.strip() + "\n", encoding="utf-8")
-                    elif Path(backup_path).exists():
-                        shutil.copy2(backup_path, "/etc/hosts")
-            except PermissionError:
-                LOGGER.warning("No permission to restore /etc/hosts")
-            except Exception as exc:
-                register_error("focus_mode", str(exc))
-                LOGGER.exception("focus_revert_hosts_failed")
+            ok, msg = PLATFORM_ADAPTER.revert_focus_web_block(backup_path)
+            if not ok:
+                register_error("focus_mode", msg)
+                LOGGER.warning("focus_revert_hosts_failed: %s", msg)
 
             if self.dnd_changed:
                 try:
-                    subprocess.run(
-                        [
-                            "gsettings",
-                            "set",
-                            "org.gnome.desktop.notifications",
-                            "show-banners",
-                            "true",
-                        ],
-                        check=False,
-                    )
+                    if platform.system().lower() == "linux":
+                        subprocess.run(
+                            [
+                                "gsettings",
+                                "set",
+                                "org.gnome.desktop.notifications",
+                                "show-banners",
+                                "true",
+                            ],
+                            check=False,
+                        )
                 except Exception:
                     pass
 
@@ -2740,6 +2727,8 @@ def show_quran_gate(config: Dict[str, Any], db: AssistantDB):
         if next_unit > max_count:
             next_unit = 1 if qcfg.get("restart_on_complete", False) else max_count
         set_quran_current_unit(mode, next_unit, db)
+        progress = get_quran_daily_progress(mode)
+        set_quran_daily_progress(mode, progress.get("done", 0) + 1)
         if mode == "rub":
             LEGACY_QURAN_STATE_PATH.write_text(json.dumps({"current_rub": next_unit}, ensure_ascii=False, indent=2), encoding="utf-8")
     elif result["action"] == "snooze":
@@ -2950,6 +2939,18 @@ class PrayerReminderThread(ManagedThread):
             if now_dt > end_window and self.status_cache.get(name) != "prayed" and not self._done("missed", name):
                 self._mark_status(name, "missed", "window_expired")
                 notify("الصلاة", f"تم تسجيل {display_name} كـ فائتة", category="prayers")
+                if is_feature_enabled("prayer_recovery_flow"):
+                    notify(
+                        "Prayer Recovery",
+                        (
+                            f"Missed {display_name}. Recovery plan:\\n"
+                            "1) Pray next prayer on time\\n"
+                            "2) Make a 2-minute dua now\\n"
+                            "3) Review blockers tonight"
+                        ),
+                        category="prayers",
+                        force=True,
+                    )
                 self._set_done("missed", name)
 
     def loop(self):
@@ -3164,6 +3165,7 @@ class GoogleCalendarThread(ManagedThread):
         super().__init__("GoogleCalendarThread", config, db)
         self.notified_events = set()
         self.prep_notified = set()
+        self.auto_focus_started = set()
 
     def loop(self):
         cfg = self.config.get("google_calendar", {})
@@ -3178,6 +3180,8 @@ class GoogleCalendarThread(ManagedThread):
 
         notify_before = int(cfg.get("notify_before_minutes", 10))
         prep_before = int(cfg.get("meeting_prep_minutes", 30))
+        auto_focus_before = int(cfg.get("auto_focus_before_minutes", 20))
+        auto_focus_after = int(cfg.get("auto_focus_after_minutes", 10))
         poll_seconds = int(cfg.get("poll_seconds", 60))
         max_events = int(cfg.get("max_events", 40))
 
@@ -3259,6 +3263,20 @@ class GoogleCalendarThread(ManagedThread):
                     notify("Meeting Prep", prep_msg, category="calendar")
                     self.prep_notified.add(event_id)
 
+                if (
+                    is_feature_enabled("calendar_auto_focus")
+                    and -auto_focus_after <= delta_min <= auto_focus_before
+                    and event_id not in self.auto_focus_started
+                ):
+                    enable_focus_mode(auto_focus_before + auto_focus_after)
+                    notify(
+                        "Auto Focus",
+                        f"Focus mode auto-enabled around meeting: {summary}",
+                        category="calendar",
+                        force=True,
+                    )
+                    self.auto_focus_started.add(event_id)
+
             self.sleep(poll_seconds)
 
 
@@ -3288,11 +3306,7 @@ class FocusModeThread(ManagedThread):
                 FOCUS_MANAGER.revert(self.config)
 
             if FOCUS_MANAGER and FOCUS_MANAGER.active:
-                for app in apps:
-                    try:
-                        subprocess.run(["pkill", "-f", app], check=False)
-                    except Exception:
-                        pass
+                PLATFORM_ADAPTER.apply_focus_app_block(apps)
 
             self.sleep(12)
 
@@ -3301,6 +3315,7 @@ class DailyReportThread(ManagedThread):
     def __init__(self, config: Dict[str, Any], db: AssistantDB):
         super().__init__("DailyReportThread", config, db)
         self.last_report_date: Optional[date] = None
+        self.last_weekly_check: Optional[str] = None
 
     def loop(self):
         cfg = self.config.get("daily_report", {})
@@ -3319,6 +3334,7 @@ class DailyReportThread(ManagedThread):
                 metrics = self.db.get_day_metrics(day_key(n))
                 streak = self.db.get_prayer_streak()
                 chart = build_compliance_chart_lines(self.db.get_week_compliance(7))
+                score_payload = compute_daily_score_payload(metrics, streak)
 
                 msg_lines = [
                     f"تقرير {day_key(n)}",
@@ -3329,6 +3345,7 @@ class DailyReportThread(ManagedThread):
                     f"- راحة عين: {metrics.get('eye_breaks', 0)}",
                     f"- الصلوات: {metrics.get('prayers_prayed', 0)}/{metrics.get('prayers_planned', 0)}",
                     f"- Prayer streak: {streak} days",
+                    f"- Daily score: {score_payload.get('total', 0)}/100",
                     "",
                     "Weekly compliance:",
                 ]
@@ -3339,6 +3356,16 @@ class DailyReportThread(ManagedThread):
                 print("\n" + "=" * 45)
                 print(msg)
                 print("=" * 45 + "\n")
+
+            if is_feature_enabled("weekly_report_push") and n.weekday() == 4 and n.hour >= 21:
+                week_key = f"{n.strftime('%Y')}-W{n.strftime('%V')}"
+                if not self.db.is_weekly_report_sent(week_key):
+                    week_rows = self.db.get_week_compliance(7)
+                    chart = build_compliance_chart_lines(week_rows)
+                    summary = [f"Weekly Report {week_key}", "", "Weekly compliance:"] + chart
+                    payload = "\n".join(summary)
+                    notify("Weekly Report", payload, category="general", force=True)
+                    self.db.mark_weekly_report_sent(week_key, payload)
 
             self.sleep(30)
 
@@ -3792,6 +3819,8 @@ th {
         <div class="stat"><small>Now</small><strong id="now">-</strong></div>
         <div class="stat"><small>Uptime</small><strong id="uptime">-</strong></div>
         <div class="stat"><small>Next Prayer</small><strong id="next-prayer">-</strong></div>
+        <div class="stat"><small>Daily Score</small><strong id="daily-score">0/100</strong></div>
+        <div class="stat"><small>Mode</small><strong id="active-mode">workday</strong></div>
         <div class="stat"><small>Pause Until</small><strong id="pause-until">-</strong></div>
         <div class="stat"><small>Snooze Until</small><strong id="snooze-until">-</strong></div>
         <div class="stat"><small>Focus Override Until</small><strong id="focus-until">-</strong></div>
@@ -3826,6 +3855,20 @@ th {
         <input type="number" min="1" max="604" id="quran-unit" name="unit" value="1">
         <button class="btn btn-warn" type="submit">Reset Quran</button>
       </form>
+      <form class="inline" data-action="/action/mode">
+        <select name="mode" id="mode-select">
+          <option value="workday">workday</option>
+          <option value="light">light</option>
+          <option value="ramadan">ramadan</option>
+        </select>
+        <span class="field-label">Profile</span>
+        <button class="btn btn-main" type="submit">Apply Mode</button>
+      </form>
+      <form class="inline" data-action="/action/quran_goal">
+        <span class="field-label">Quran goal</span>
+        <input type="number" min="1" max="60" id="quran-goal-input" name="units" value="1">
+        <button class="btn btn-main" type="submit">Set Goal</button>
+      </form>
       <div class="btn-row">
         <button class="btn btn-soft" type="button" data-action-button="/action/clear_pause">Clear Pause</button>
         <button class="btn btn-soft" type="button" data-action-button="/action/clear_snooze">Clear Snooze</button>
@@ -3834,6 +3877,7 @@ th {
       </div>
       <p class="hint" id="action-feedback"></p>
       <p class="hint">Current Quran: <strong id="quran-state">-</strong></p>
+      <p class="hint">Quran Goal: <strong id="quran-goal">0/1</strong></p>
     </article>
 
     <article class="card span-4">
@@ -3860,6 +3904,11 @@ th {
     <article class="card span-4">
       <h2>Feature Toggles</h2>
       <div class="list" id="toggles"></div>
+    </article>
+
+    <article class="card span-4">
+      <h2>Platform Capabilities</h2>
+      <div class="list" id="capabilities"></div>
     </article>
 
     <article class="card span-6">
@@ -4076,6 +4125,32 @@ function renderToggles(toggleMap) {
   });
 }
 
+function renderCapabilities(capabilities) {
+  const wrap = $("capabilities");
+  if (!wrap) {
+    return;
+  }
+  wrap.textContent = "";
+  const entries = Object.entries(capabilities || {});
+  if (!entries.length) {
+    wrap.appendChild(makeEmpty("No capability data."));
+    return;
+  }
+  entries.sort((a, b) => a[0].localeCompare(b[0]));
+  entries.forEach(([name, enabled]) => {
+    const row = document.createElement("div");
+    row.className = "toggle-row";
+    const label = document.createElement("strong");
+    label.textContent = name;
+    row.appendChild(label);
+    const state = document.createElement("span");
+    state.className = `badge ${enabled ? "ok" : "off"}`;
+    state.textContent = enabled ? "YES" : "NO";
+    row.appendChild(state);
+    wrap.appendChild(row);
+  });
+}
+
 function renderThreads(threadsObj) {
   const body = $("threads-body");
   body.textContent = "";
@@ -4204,6 +4279,7 @@ function renderBookmarks(bookmarks) {
 
 function renderSnapshot(snap) {
   const metrics = snap.today_metrics || {};
+  const score = snap.daily_score || {};
   const nextPrayer = snap.next_prayer && snap.next_prayer.name
     ? `${snap.next_prayer.name} at ${formatIso(snap.next_prayer.at)}`
     : "-";
@@ -4214,6 +4290,11 @@ function renderSnapshot(snap) {
   setText("pause-until", formatIso(snap.pause_until));
   setText("snooze-until", formatIso(snap.snooze_until));
   setText("focus-until", formatIso(snap.focus_override_until));
+  setText("daily-score", `${Number(score.total || 0)}/100`);
+  setText("active-mode", asText(snap.active_mode, "workday"));
+  if ($("mode-select")) {
+    $("mode-select").value = asText(snap.active_mode, "workday");
+  }
 
   const quranMode = asText(snap.quran_mode, "rub");
   const quranUnit = Number(snap.quran_current_unit || 1);
@@ -4225,6 +4306,12 @@ function renderSnapshot(snap) {
     const maxUnit = MAX_QURAN_UNIT[quranMode] || 604;
     $("quran-unit").max = String(maxUnit);
     $("quran-unit").value = String(Math.min(maxUnit, Math.max(1, quranUnit)));
+  }
+  const quranGoal = Number(snap.quran_daily_goal || 1);
+  const quranDone = Number((snap.quran_daily_progress || {}).done || 0);
+  setText("quran-goal", `${quranDone}/${quranGoal}`);
+  if ($("quran-goal-input")) {
+    $("quran-goal-input").value = String(quranGoal);
   }
 
   setText("pomodoro", metrics.pomodoro_sessions || 0);
@@ -4246,6 +4333,7 @@ function renderSnapshot(snap) {
   renderApiSuccess(snap.last_api_success || {});
   renderWeekly(snap.weekly_compliance || []);
   renderToggles(snap.feature_toggles || {});
+  renderCapabilities(snap.capabilities || {});
   renderThreads(snap.threads || {});
   renderEvents(snap.recent_events || []);
   renderErrors(Array.isArray(snap.last_errors) ? [...snap.last_errors].reverse() : []);
@@ -4367,6 +4455,20 @@ setInterval(refreshStatus, 15000);
                 }
             )
 
+        @app.get("/api/capabilities")
+        def api_capabilities():
+            return jsonify(
+                {
+                    "platform": platform.system(),
+                    "capabilities": PLATFORM_ADAPTER.capabilities(),
+                }
+            )
+
+        @app.get("/api/score")
+        def api_score():
+            snap = runtime_snapshot()
+            return jsonify(snap.get("daily_score", {}))
+
         @app.route("/action/pause", methods=action_methods)
         def action_pause():
             minutes = parse_bounded_int(request.values.get("minutes", "30"), 30, 1, 720)
@@ -4401,6 +4503,37 @@ setInterval(refreshStatus, 15000);
         def action_focus_off():
             disable_focus_mode()
             return action_response("focus_off", "Focus mode disabled.")
+
+        @app.route("/action/mode", methods=action_methods)
+        def action_mode():
+            mode = str(request.values.get("mode", "")).strip().lower()
+            if not mode:
+                return action_error("Mode is required.")
+            if not set_mode(mode):
+                return action_error("Unknown mode.")
+            notify("Mode", f"Active mode set to {mode}.", force=True)
+            return action_response("mode", f"Mode switched to {mode}.", mode=mode)
+
+        @app.route("/action/quran_goal", methods=action_methods)
+        def action_quran_goal():
+            units = parse_bounded_int(request.values.get("units", "1"), 1, 1, 60)
+            final = set_quran_daily_goal(units)
+            notify("Quran Goal", f"Daily goal set to {final} units.", category="quran", force=True)
+            return action_response("quran_goal", f"Daily Quran goal set to {final}.", units=final)
+
+        @app.route("/action/mark_prayer", methods=action_methods)
+        def action_mark_prayer():
+            prayer = str(request.values.get("prayer", "")).strip().lower()
+            status = str(request.values.get("status", "prayed")).strip().lower()
+            if prayer not in {"fajr", "dhuhr", "asr", "maghrib", "isha"}:
+                return action_error("Unknown prayer name.")
+            if status not in {"prayed", "missed"}:
+                return action_error("Status must be prayed or missed.")
+            if not DB:
+                return action_error("Database is not ready.", code=500)
+            DB.upsert_prayer_status(day_key(), prayer, status, "dashboard_manual")
+            notify("Prayer", f"{prayer} marked as {status}.", category="prayers", force=True)
+            return action_response("mark_prayer", f"{prayer} marked as {status}.", prayer=prayer, status=status)
 
         @app.route("/action/toggle/<feature>", methods=action_methods)
         def action_toggle(feature: str):
@@ -4578,6 +4711,37 @@ class TelegramBotThread(ManagedThread):
             for i in range(0, len(text), chunk_size):
                 await update.message.reply_text(text[i : i + chunk_size])
 
+        async def send_text(update: Update, text: str, reply_markup=None):
+            if update.message:
+                await update.message.reply_text(text, reply_markup=reply_markup)
+                return
+            if update.callback_query and update.callback_query.message:
+                await update.callback_query.message.reply_text(text, reply_markup=reply_markup)
+
+        def build_control_panel_markup() -> InlineKeyboardMarkup:
+            rows = [
+                [
+                    InlineKeyboardButton("Pause 15m", callback_data="act_pause_15"),
+                    InlineKeyboardButton("Snooze 15m", callback_data="act_snooze_15"),
+                ],
+                [
+                    InlineKeyboardButton("Focus 90m", callback_data="act_focus_90"),
+                    InlineKeyboardButton("Focus Off", callback_data="act_focus_off"),
+                ],
+                [
+                    InlineKeyboardButton("Prayed Fajr", callback_data="act_mark_prayer_done_fajr"),
+                    InlineKeyboardButton("Prayed Dhuhr", callback_data="act_mark_prayer_done_dhuhr"),
+                ],
+                [
+                    InlineKeyboardButton("Prayed Asr", callback_data="act_mark_prayer_done_asr"),
+                    InlineKeyboardButton("Prayed Maghrib", callback_data="act_mark_prayer_done_maghrib"),
+                ],
+                [
+                    InlineKeyboardButton("Prayed Isha", callback_data="act_mark_prayer_done_isha"),
+                ],
+            ]
+            return InlineKeyboardMarkup(rows)
+
         def desktop_observe_allowed() -> Tuple[bool, str]:
             if not allow_desktop_observe:
                 return False, "Desktop observe commands are disabled in config."
@@ -4603,6 +4767,89 @@ class TelegramBotThread(ManagedThread):
             )
             text = f"{header}\n\n{snap_text}\n\n{cal_title}:\n{cal_text}"
             await reply_text_chunked(update, text)
+
+        async def cmd_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            if not await authorized(update, require_control=True):
+                return
+            if not is_feature_enabled("telegram_inline_panel"):
+                await send_text(update, "Inline panel is disabled by feature flag.")
+                return
+            await send_text(update, "Control Panel", reply_markup=build_control_panel_markup())
+
+        async def cmd_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            if not await authorized(update):
+                return
+            mode = (context.args[0] if context.args else "").strip().lower()
+            if not mode:
+                await send_text(update, f"Current mode: {current_mode()}. Usage: /mode <workday|light|ramadan>")
+                return
+            if not set_mode(mode):
+                await send_text(update, "Unknown mode. Use: workday, light, ramadan")
+                return
+            await send_text(update, f"Mode switched to {mode}.")
+
+        async def cmd_goal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            if not await authorized(update):
+                return
+            if not context.args:
+                await send_text(update, f"Quran daily goal: {get_quran_daily_goal()} unit(s). Usage: /goal [units]")
+                return
+            units = parse_int_arg(context.args[0], default=get_quran_daily_goal(), min_value=1, max_value=60)
+            final = set_quran_daily_goal(units)
+            await send_text(update, f"Quran daily goal set to {final} unit(s).")
+
+        async def cmd_weekly(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            if not await authorized(update):
+                return
+            await send_text(update, build_weekly_summary_text())
+
+        async def cmd_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            query = update.callback_query
+            if not query:
+                return
+            await query.answer()
+            if not await authorized(update, require_control=True):
+                return
+
+            data = str(query.data or "")
+            if data == "act_pause_15":
+                set_pause(15)
+                await send_text(update, "Paused for 15 minutes.")
+                return
+            if data == "act_snooze_15":
+                set_snooze(15)
+                await send_text(update, "Snoozed for 15 minutes.")
+                return
+            if data == "act_focus_90":
+                enable_focus_mode(90)
+                await send_text(update, "Focus mode enabled for 90 minutes.")
+                return
+            if data == "act_focus_off":
+                disable_focus_mode()
+                await send_text(update, "Focus mode disabled.")
+                return
+            if data.startswith("act_mark_prayer_done_"):
+                prayer_name = data.replace("act_mark_prayer_done_", "", 1)
+                if prayer_name not in {"fajr", "dhuhr", "asr", "maghrib", "isha"}:
+                    await send_text(update, "Unknown prayer.")
+                    return
+                if DB:
+                    DB.upsert_prayer_status(day_key(), prayer_name, "prayed", "telegram_panel")
+                await send_text(update, f"{prayer_name} marked as prayed.")
+                return
+            if data.startswith("act_confirm_power:"):
+                token_val = data.split(":", 1)[1]
+                payload = SENSITIVE_ACTIONS.consume(token_val)
+                if not payload:
+                    await send_text(update, "Confirmation token expired.")
+                    return
+                action_name, value = payload.split("|", 1)
+                ok, msg = await asyncio.to_thread(execute_power_action, action_name, value)
+                await send_text(update, msg if ok else f"{action_name} failed: {msg}")
+                return
+            if data == "act_cancel_sensitive":
+                await send_text(update, "Action canceled.")
+                return
 
         async def cmd_chatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not await authorized(update):
@@ -4772,6 +5019,17 @@ class TelegramBotThread(ManagedThread):
                     await update.message.reply_text("Power commands are disabled in config.")
                 return
             value = context.args[0] if context.args else "now"
+            if is_feature_enabled("telegram_sensitive_confirm"):
+                token_val = SENSITIVE_ACTIONS.create(f"shutdown|{value}")
+                kb = InlineKeyboardMarkup(
+                    [
+                        [InlineKeyboardButton("Confirm Shutdown", callback_data=f"act_confirm_power:{token_val}")],
+                        [InlineKeyboardButton("Cancel", callback_data="act_cancel_sensitive")],
+                    ]
+                )
+                if update.message:
+                    await update.message.reply_text("Confirm shutdown action:", reply_markup=kb)
+                return
             ok, msg = await asyncio.to_thread(execute_power_action, "shutdown", value)
             if update.message:
                 await update.message.reply_text(msg if ok else f"Shutdown failed: {msg}")
@@ -4784,6 +5042,17 @@ class TelegramBotThread(ManagedThread):
                     await update.message.reply_text("Power commands are disabled in config.")
                 return
             value = context.args[0] if context.args else "now"
+            if is_feature_enabled("telegram_sensitive_confirm"):
+                token_val = SENSITIVE_ACTIONS.create(f"reboot|{value}")
+                kb = InlineKeyboardMarkup(
+                    [
+                        [InlineKeyboardButton("Confirm Reboot", callback_data=f"act_confirm_power:{token_val}")],
+                        [InlineKeyboardButton("Cancel", callback_data="act_cancel_sensitive")],
+                    ]
+                )
+                if update.message:
+                    await update.message.reply_text("Confirm reboot action:", reply_markup=kb)
+                return
             ok, msg = await asyncio.to_thread(execute_power_action, "reboot", value)
             if update.message:
                 await update.message.reply_text(msg if ok else f"Reboot failed: {msg}")
@@ -4814,6 +5083,10 @@ class TelegramBotThread(ManagedThread):
                 "/today\n"
                 "/status\n"
                 "/chatid\n"
+                "/panel\n"
+                "/mode <workday|light|ramadan>\n"
+                "/goal [units]\n"
+                "/weekly\n"
                 "/snooze [min]\n"
                 "/pause [min]\n"
                 "/focus [min]\n"
@@ -4838,6 +5111,8 @@ class TelegramBotThread(ManagedThread):
             if not await authorized(update):
                 return
             await cmd_today(update, context)
+            if is_feature_enabled("telegram_inline_panel"):
+                await cmd_panel(update, context)
             await cmd_help(update, context)
 
         async def post_init_notify(application: TelegramApplication):
@@ -4872,6 +5147,10 @@ class TelegramBotThread(ManagedThread):
         app.add_handler(CommandHandler("today", cmd_today))
         app.add_handler(CommandHandler("chatid", cmd_chatid))
         app.add_handler(CommandHandler("status", cmd_status))
+        app.add_handler(CommandHandler("panel", cmd_panel))
+        app.add_handler(CommandHandler("mode", cmd_mode))
+        app.add_handler(CommandHandler("goal", cmd_goal))
+        app.add_handler(CommandHandler("weekly", cmd_weekly))
         app.add_handler(CommandHandler("snooze", cmd_snooze))
         app.add_handler(CommandHandler("pause", cmd_pause))
         app.add_handler(CommandHandler("focus", cmd_focus))
@@ -4888,6 +5167,7 @@ class TelegramBotThread(ManagedThread):
         app.add_handler(CommandHandler("reboot", cmd_reboot))
         app.add_handler(CommandHandler("cancelpower", cmd_cancel_power))
         app.add_handler(CommandHandler("quitassistant", cmd_quit_assistant))
+        app.add_handler(CallbackQueryHandler(cmd_callback))
 
         LOGGER.info("Telegram bot polling started")
         app.run_polling(stop_signals=None, close_loop=False)
@@ -4897,7 +5177,64 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Personal Assistant")
     parser.add_argument("--status", action="store_true", help="Print current status and exit")
     parser.add_argument("--validate-config", action="store_true", help="Validate config and exit")
+    parser.add_argument("--install-autostart", action="store_true", help="Install startup task/entry")
+    parser.add_argument("--uninstall-autostart", action="store_true", help="Remove startup task/entry")
+    parser.add_argument("--print-capabilities", action="store_true", help="Print platform capabilities and exit")
+    parser.add_argument("--run-doctor", action="store_true", help="Run diagnostics and exit")
     return parser.parse_args()
+
+
+def entry_command() -> str:
+    script_path = str(BASE_DIR / "personal_assistant.py")
+    if platform.system().lower() == "windows":
+        return f'"{sys.executable}" "{script_path}"'
+    return f"{shlex.quote(sys.executable)} {shlex.quote(script_path)}"
+
+
+def install_autostart_cli() -> Tuple[bool, str]:
+    if platform.system().lower() == "windows":
+        return install_windows_task(entry_command())
+    path = install_linux_autostart(entry_command())
+    return True, f"Linux autostart entry installed at {path}"
+
+
+def uninstall_autostart_cli() -> Tuple[bool, str]:
+    if platform.system().lower() == "windows":
+        return uninstall_windows_task()
+    removed = uninstall_linux_autostart()
+    if removed:
+        return True, "Linux autostart entry removed."
+    return True, "Linux autostart entry was not present."
+
+
+def doctor_report(config: Dict[str, Any]) -> str:
+    lines = [
+        "Assistant doctor report",
+        f"- Platform: {platform.system()}",
+        f"- Python: {sys.version.split()[0]}",
+        f"- Config path: {CONFIG_PATH}",
+        f"- DB path: {config.get('db_path', str(BASE_DIR / 'assistant.db'))}",
+        f"- Telegram enabled: {bool(config.get('telegram_bot', {}).get('enabled', False))}",
+        f"- Calendar enabled: {bool(config.get('google_calendar', {}).get('enabled', False))}",
+        f"- Features: {', '.join(sorted(k for k, v in CONTROL_STATE.get('feature_toggles', {}).items() if v))}",
+        "- Capabilities:",
+    ]
+    for key, value in sorted(PLATFORM_ADAPTER.capabilities().items()):
+        lines.append(f"  - {key}: {'yes' if value else 'no'}")
+    missing_env = []
+    if config.get("security", {}).get("require_env_secrets", True):
+        if config.get("telegram_bot", {}).get("enabled", False) and not os.getenv("TELEGRAM_BOT_TOKEN"):
+            missing_env.append("TELEGRAM_BOT_TOKEN")
+        if config.get("quran_khatma", {}).get("enabled", False):
+            if not os.getenv("QURAN_CLIENT_ID"):
+                missing_env.append("QURAN_CLIENT_ID")
+            if not os.getenv("QURAN_CLIENT_SECRET"):
+                missing_env.append("QURAN_CLIENT_SECRET")
+    if missing_env:
+        lines.append(f"- Missing required env vars: {', '.join(missing_env)}")
+    else:
+        lines.append("- Required env vars: OK")
+    return "\n".join(lines)
 
 
 def install_signal_handlers():
@@ -4929,7 +5266,32 @@ def main():
     global APP_CONFIG, APP_TZ, HTTP, DB, FOCUS_MANAGER
 
     args = parse_args()
+
+    if args.print_capabilities:
+        print(json.dumps(PLATFORM_ADAPTER.capabilities(), indent=2, ensure_ascii=False))
+        return
+
+    if args.install_autostart:
+        ok, msg = install_autostart_cli()
+        print(msg)
+        if not ok:
+            raise SystemExit(1)
+        return
+
+    if args.uninstall_autostart:
+        ok, msg = uninstall_autostart_cli()
+        print(msg)
+        if not ok:
+            raise SystemExit(1)
+        return
+
     config = load_config()
+    APP_CONFIG = config
+
+    if args.run_doctor:
+        init_feature_toggles(config)
+        print(doctor_report(config))
+        return
 
     errors, warnings = validate_config(config)
     if errors:
@@ -4943,13 +5305,14 @@ def main():
     for warning in warnings:
         LOGGER.warning("config_warning: %s", warning)
 
-    APP_CONFIG = config
     APP_TZ = ZoneInfo(config.get("timezone", "UTC"))
     HTTP = build_http_session(config.get("http", {}))
 
     DB = AssistantDB(Path(config.get("db_path", str(BASE_DIR / "assistant.db"))))
     migrate_legacy_quran_state(DB)
     init_feature_toggles(config)
+    if is_feature_enabled("personal_modes"):
+        set_mode(config.get("personal_modes", {}).get("default_mode", "workday"))
 
     FOCUS_MANAGER = FocusModeManager()
 
@@ -4972,11 +5335,17 @@ def main():
     print(greet)
     notify("Welcome", greet, force=True)
 
+    threads = build_threads(config, DB)
+    early_threads = [t for t in threads if t.name == "TelegramBotThread"]
+    for t in early_threads:
+        t.start()
+
     show_today_calendar_summary(config)
     show_quran_gate(config, DB)
 
-    threads = build_threads(config, DB)
     for t in threads:
+        if t in early_threads:
+            continue
         t.start()
 
     try:

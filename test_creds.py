@@ -1,10 +1,14 @@
+import os
 import requests
-import json
 
-def test_credentials():
-    url = "https://oauth2.quran.foundation/oauth2/token"
-    client_id = "7c573abe-1b9b-4a72-bf06-2aae93970fea"
-    client_secret = "TAoKY4R93~9Y.Tcyu_eWMoCM_-"
+
+def run_credentials_check():
+    url = os.getenv("QURAN_AUTH_URL", "https://oauth2.quran.foundation/oauth2/token")
+    client_id = os.getenv("QURAN_CLIENT_ID", "")
+    client_secret = os.getenv("QURAN_CLIENT_SECRET", "")
+
+    if not client_id or not client_secret:
+        raise SystemExit("Set QURAN_CLIENT_ID and QURAN_CLIENT_SECRET first.")
 
     print(f"Testing credentials against {url}...")
     try:
@@ -12,10 +16,10 @@ def test_credentials():
             url,
             data={
                 "grant_type": "client_credentials",
-                "scope": "content"
+                "scope": "content",
             },
             auth=(client_id, client_secret),
-            timeout=10
+            timeout=10,
         )
         print(f"Status Code: {resp.status_code}")
         if resp.status_code == 200:
@@ -27,5 +31,6 @@ def test_credentials():
     except Exception as e:
         print(f"Error: {e}")
 
+
 if __name__ == "__main__":
-    test_credentials()
+    run_credentials_check()

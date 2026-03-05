@@ -19,9 +19,9 @@ python-telegram-bot>=21.0
 # Screenshot backend (recommended for Telegram /screenshot)
 mss>=10.0.0
 
-# Extra screenshot fallback via Pillow ImageGrab
-# (Pillow is already required for tray support above)
-
 # Arabic rendering for Tkinter Quran gate
 arabic-reshaper>=3.0.0
 python-bidi>=0.4.2
+
+# Testing
+pytest>=8.2.0
